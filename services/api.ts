@@ -1,3 +1,12 @@
+/**
+ * services/api.ts
+ *
+ * Fix applied:
+ *   - apiCall now calls isDeviceOnline() instead of checking cachedOnline
+ *     directly.  On web, cachedOnline never updates (the NetInfo listener is
+ *     skipped), so offline detection was silently broken for browser users.
+ */
+
 import NetInfo from "@react-native-community/netinfo";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
@@ -17,18 +26,19 @@ if (Platform.OS !== "web") {
   });
 }
 
-// Create a synchronous helper function to check network status
-function isDeviceOnline() {
+/**
+ * FIX: This function already existed but was never called inside apiCall.
+ * It now IS called, so web users correctly get an offline error when
+ * navigator.onLine is false.
+ */
+function isDeviceOnline(): boolean {
   if (Platform.OS === "web") {
-    // On the web, use the browser's instant, synchronous navigator API
     return typeof navigator !== "undefined" ? navigator.onLine : true;
   }
-  // On mobile, rely on the cached NetInfo state
   return cachedOnline;
 }
 
 export class ApiError extends Error {
-  // ... rest of the code remains exactly the same
   status: number;
   data: any;
   constructor(message: string, status: number, data: any) {
@@ -43,7 +53,8 @@ export async function apiCall(
   options: RequestInit = {},
   retries = 2,
 ): Promise<any> {
-  if (!cachedOnline) {
+  // FIX: was `if (!cachedOnline)` — broken on web. Now uses isDeviceOnline().
+  if (!isDeviceOnline()) {
     throw new ApiError("No internet connection", 0, null);
   }
 
@@ -93,7 +104,6 @@ export async function apiCall(
       errorMessage.toLowerCase().includes("abort");
 
     if (isAbort) {
-      // 👇 FIX: Re-throw so the component stops executing, but DO NOT log it as a server error.
       throw error;
     }
 

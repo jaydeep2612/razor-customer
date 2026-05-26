@@ -1,7 +1,25 @@
+/**
+ * app/(tabs)/bills.tsx
+ *
+ * Fixes applied:
+ *   1. RAZORPAY WEB: Import changed from `react-native-razorpay` to
+ *      `../../services/razorpay` which resolves to the correct .web.ts or
+ *      .native.ts shim automatically via Metro bundler.
+ *
+ *   2. EXPO-PRINT / EXPO-SHARING: These are now lazy-imported inside the
+ *      native branch of handleDownloadBill so they are never evaluated on web.
+ *
+ *   3. ACTIVE METHOD LOGIC: Fixed so that payment_method values of "online",
+ *      "pending", or anything other than "cash" correctly shows the UPI /
+ *      Razorpay tab instead of rendering nothing.
+ *
+ *   4. VARIABLE ORDERING: tableNum, restaurantName, restaurantLogo,
+ *      restaurantAddress, displayHostName moved to top of component so they
+ *      are in scope when handleRazorpayPayment is defined.
+ */
+
 import { Ionicons, MaterialIcons } from "@expo/vector-icons";
-import * as Print from "expo-print";
 import { router, useLocalSearchParams } from "expo-router";
-import * as Sharing from "expo-sharing";
 import React, {
   useCallback,
   useEffect,
@@ -23,11 +41,14 @@ import {
   View,
 } from "react-native";
 import QRCode from "react-native-qrcode-svg";
-import RazorpayCheckout from "react-native-razorpay"; // 👈 IMPORT RAZORPAY
+
+// FIX 1: Use platform-aware shim instead of react-native-razorpay directly.
+// Metro resolves this to razorpay.web.ts on web and razorpay.native.ts on mobile.
+import RazorpayCheckout from "../../services/razorpay";
 
 import { THEME } from "../../constants/theme";
 import { useSession } from "../../context/SessionContext";
-import { apiCall } from "../../services/api"; // 👈 IMPORT API HELPER
+import { apiCall } from "../../services/api";
 import { initEcho } from "../../services/echo";
 import { OrderService } from "../../services/order.service";
 import { SessionService } from "../../services/session.service";
@@ -58,11 +79,24 @@ export default function BillsTab() {
   const { billRequested } = useLocalSearchParams<{ billRequested?: string }>();
   const isRoom = tableData?.type === "room";
 
+  // ─── FIX 4: Derived variables moved to the top so handleRazorpayPayment
+  //            can safely close over them. ────────────────────────────────
+  const currency = menuData?.restaurant?.currency_symbol || "₹";
+  const restaurantName = menuData?.restaurant?.name || "Restaurant Bill";
+  const restaurantLogo = menuData?.restaurant?.logo || null;
+  const restaurantAddress = menuData?.restaurant?.address || "";
+  const tableNum = menuData?.table?.number || tableData?.tId || "-";
+  const displayHostName = isPrimary
+    ? customerName
+    : menuData?.session?.host_name || "Customer";
+  const sessionId =
+    menuData?.session?.id || menuData?.session?.session_id || tableData?.tId;
+  // ─────────────────────────────────────────────────────────────────────────
+
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
-  const [isProcessingPayment, setIsProcessingPayment] = useState(false); // 👈 NEW STATE FOR RAZORPAY
-
+  const [isProcessingPayment, setIsProcessingPayment] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<
     "connecting" | "live" | "offline"
   >("connecting");
@@ -70,10 +104,6 @@ export default function BillsTab() {
   const [billingSummary, setBillingSummary] = useState<any>(null);
 
   const echoRef = useRef<any>(null);
-
-  const currency = menuData?.restaurant?.currency_symbol || "₹";
-  const sessionId =
-    menuData?.session?.id || menuData?.session?.session_id || tableData?.tId;
 
   const mergeOrders = (incomingOrders: any[]) => {
     setOrders((prev) => {
@@ -239,13 +269,15 @@ export default function BillsTab() {
     }
   };
 
-  // 👇 ADDED: SECURE RAZORPAY INTEGRATION LOGIC 👇
+  // ─── RAZORPAY PAYMENT HANDLER ────────────────────────────────────────────
+  // All variables it closes over (tableNum, restaurantName, etc.) are now
+  // declared above this function so there is no temporal-dead-zone risk.
   const handleRazorpayPayment = async () => {
     if (!paymentData?.id || !sessionToken) return;
     setIsProcessingPayment(true);
 
     try {
-      // 1. Ask Backend to Create Razorpay Order securely
+      // 1. Ask backend to create a Razorpay order securely
       const orderResponse = await apiCall("/payment/razorpay/create", {
         method: "POST",
         body: JSON.stringify({ payment_id: paymentData.id }),
@@ -255,24 +287,22 @@ export default function BillsTab() {
         },
       });
 
-      // 2. Open Native Razorpay Modal
+      // 2. Open Razorpay checkout (native SDK on mobile, checkout.js on web)
       const options = {
         description: `Bill for ${isRoom ? "Room" : "Table"} ${tableNum}`,
-        image: restaurantLogo || "https://annsathi.com/logo.png", // Replace with your actual public URL
+        image: restaurantLogo || "https://annsathi.com/logo.png",
         currency: orderResponse.currency,
         key: orderResponse.key,
-        amount: orderResponse.amount, // Secured paise amount from backend
+        amount: orderResponse.amount,
         name: restaurantName,
         order_id: orderResponse.razorpay_order_id,
         theme: { color: ANN.darkBlue },
-        prefill: {
-          name: displayHostName,
-        },
+        prefill: { name: displayHostName },
       };
 
       const data = await RazorpayCheckout.open(options);
 
-      // 3. Verify Payment
+      // 3. Verify the payment with the backend
       await apiCall("/payment/razorpay/verify", {
         method: "POST",
         body: JSON.stringify({
@@ -296,23 +326,30 @@ export default function BillsTab() {
         );
       }
 
-      // Refresh to get updated status
       fetchOrders();
     } catch (error: any) {
       if (error.code) {
-        // This is a native SDK error (user closed the modal, network error in SDK)
-        Alert.alert("Payment Cancelled", "Transaction was not completed.");
+        // Native SDK / web modal error (user cancelled, network error in SDK)
+        if (Platform.OS === "web") {
+          window.alert("Payment Cancelled. Transaction was not completed.");
+        } else {
+          Alert.alert("Payment Cancelled", "Transaction was not completed.");
+        }
       } else {
-        // This is a Backend API error (fraud attempt, expired, etc.)
-        Alert.alert(
-          "Notice",
-          error.message || "Could not process payment. Please try again.",
-        );
+        // Backend API error (fraud attempt, expired order, etc.)
+        const msg =
+          error.message || "Could not process payment. Please try again.";
+        if (Platform.OS === "web") {
+          window.alert(msg);
+        } else {
+          Alert.alert("Notice", msg);
+        }
       }
     } finally {
       setIsProcessingPayment(false);
     }
   };
+  // ─────────────────────────────────────────────────────────────────────────
 
   const { consolidatedItems, rawSubtotal, totalItemsCount } = useMemo(() => {
     const itemMap = new Map();
@@ -357,20 +394,10 @@ export default function BillsTab() {
   const finalDiscount = parseFloat(paymentData?.discount_amount || 0);
   const finalTax = parseFloat(paymentData?.tax_amount || 0);
   const finalExtraCharges = parseFloat(paymentData?.extra_charges || 0);
-
   const calculatedGrandTotal =
     finalSubtotal - finalDiscount + finalTax + finalExtraCharges;
-
   const amountPaid = parseFloat(billingSummary?.amount_paid || 0);
   const amountDue = isBillPaid ? 0 : parseFloat(paymentData?.amount || 0);
-
-  const restaurantName = menuData?.restaurant?.name || "Restaurant Bill";
-  const restaurantLogo = menuData?.restaurant?.logo || null;
-  const restaurantAddress = menuData?.restaurant?.address || "";
-  const tableNum = menuData?.table?.number || tableData?.tId || "-";
-  const displayHostName = isPrimary
-    ? customerName
-    : menuData?.session?.host_name || "Customer";
 
   const upiId = paymentData?.upi_id || menuData?.restaurant?.upi_id || "";
   const pa = encodeURIComponent(upiId);
@@ -386,8 +413,10 @@ export default function BillsTab() {
   const cu = "INR";
   const upiString = `upi://pay?pa=${pa}&pn=${pn}&tr=${tr}&tn=${tn}&mc=${mc}&am=${am}&cu=${cu}`;
 
+  // ─── DOWNLOAD BILL ───────────────────────────────────────────────────────
+  // FIX 2: expo-print and expo-sharing are lazy-imported inside the native
+  // branch so they are never evaluated on web (they throw on web).
   const handleDownloadBill = async () => {
-    // ... [Unchanged PDF generation logic]
     if (!isBillPaid && amountDue > 0) return;
     setIsDownloading(true);
 
@@ -396,15 +425,15 @@ export default function BillsTab() {
 
     consolidatedItems.forEach((item) => {
       itemsHtml += `
-        <div style="display: flex; justify-content: space-between; align-items: flex-start; font-size: 14px; margin-bottom: 12px; color: #1f2937;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;font-size:14px;margin-bottom:12px;color:#1f2937;">
           <div>
-             <span style="font-weight: 700;">
-               <span style="color: #6b7280; margin-right: 4px;">${item.quantity}x</span>${item.name}
-             </span>
-             <br>
-             <span style="font-size: 10px; color: #6b7280; text-transform: uppercase;">[ITEM]</span>
+            <span style="font-weight:700;">
+              <span style="color:#6b7280;margin-right:4px;">${item.quantity}x</span>${item.name}
+            </span>
+            <br>
+            <span style="font-size:10px;color:#6b7280;text-transform:uppercase;">[ITEM]</span>
           </div>
-          <span style="font-weight: 800; white-space: nowrap;">
+          <span style="font-weight:800;white-space:nowrap;">
             ${currency}${(item.total_price || 0).toFixed(2)}
           </span>
         </div>
@@ -412,30 +441,30 @@ export default function BillsTab() {
     });
 
     const receiptHTML = `
-      <div style="padding: 30px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #111827; background: #ffffff; max-width: 500px; margin: auto;">
-        ${restaurantLogo ? `<div style="text-align: center; margin-bottom: 16px;"><img src="${restaurantLogo}" alt="Restaurant Logo" style="max-height: 80px; max-width: 180px; object-fit: contain; border-radius: 8px;" /></div>` : ""}
-        <div style="text-align: center; font-size: 26px; font-weight: 900; color: #111827; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 1px;">${restaurantName}</div>
-        ${restaurantAddress ? `<div style="text-align: center; font-size: 13px; color: #4b5563; margin-bottom: 8px; line-height: 1.4; padding-left: 20px; padding-right: 20px;">${restaurantAddress}</div>` : ""}
-        <div style="text-align: center; font-size: 12px; color: #6b7280; margin-bottom: 30px;">${dateStr}</div>
-        <div style="background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 24px;">
-          <div style="text-align: center; font-size: 22px; font-weight: 900; margin-bottom: 4px;">${isRoom ? "ROOM" : "TABLE"} ${tableNum}</div>
-          <div style="text-align: center; font-size: 10px; font-weight: 700; color: #6b7280; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 24px;">FINAL BILLING SUMMARY</div>
-          <div style="background-color: #f3f4f6; padding: 10px 14px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; font-size: 14px; font-weight: 700; margin-bottom: 24px;">
+      <div style="padding:30px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827;background:#ffffff;max-width:500px;margin:auto;">
+        ${restaurantLogo ? `<div style="text-align:center;margin-bottom:16px;"><img src="${restaurantLogo}" alt="Restaurant Logo" style="max-height:80px;max-width:180px;object-fit:contain;border-radius:8px;" /></div>` : ""}
+        <div style="text-align:center;font-size:26px;font-weight:900;color:#111827;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px;">${restaurantName}</div>
+        ${restaurantAddress ? `<div style="text-align:center;font-size:13px;color:#4b5563;margin-bottom:8px;line-height:1.4;padding:0 20px;">${restaurantAddress}</div>` : ""}
+        <div style="text-align:center;font-size:12px;color:#6b7280;margin-bottom:30px;">${dateStr}</div>
+        <div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:24px;">
+          <div style="text-align:center;font-size:22px;font-weight:900;margin-bottom:4px;">${isRoom ? "ROOM" : "TABLE"} ${tableNum}</div>
+          <div style="text-align:center;font-size:10px;font-weight:700;color:#6b7280;letter-spacing:.1em;text-transform:uppercase;margin-bottom:24px;">FINAL BILLING SUMMARY</div>
+          <div style="background:#f3f4f6;padding:10px 14px;border-radius:8px;display:flex;justify-content:space-between;align-items:center;font-size:14px;font-weight:700;margin-bottom:24px;">
             <span>👑 HOST: ${displayHostName}</span>
-            <span style="font-weight: 400; font-size: 12px; color: #6b7280;">(${totalItemsCount} Items)</span>
+            <span style="font-weight:400;font-size:12px;color:#6b7280;">(${totalItemsCount} Items)</span>
           </div>
-          <div style="margin-bottom: 24px;">${itemsHtml}</div>
-          <div style="border-top: 2px solid #111827; padding-top: 16px; margin-top: 24px;">
-            <div style="display: flex; justify-content: space-between; font-size: 14px; color: #4b5563; margin-bottom: 8px;"><span>Total Orders Delivered:</span><span>${totalItemsCount}</span></div>
-            <div style="display: flex; justify-content: space-between; font-size: 14px; color: #111827; font-weight: 700; margin-bottom: 8px; margin-top: 12px;"><span>Subtotal:</span><span>${currency}${finalSubtotal.toFixed(2)}</span></div>
-            ${finalDiscount > 0 ? `<div style="display: flex; justify-content: space-between; font-size: 14px; color: #059669; margin-bottom: 8px;"><span>Discount:</span><span style="font-weight: 700;">- ${currency}${finalDiscount.toFixed(2)}</span></div>` : ""}
-            ${finalTax > 0 ? `<div style="display: flex; justify-content: space-between; font-size: 14px; color: #dc2626; margin-bottom: 8px;"><span>Tax:</span><span style="font-weight: 700;">+ ${currency}${finalTax.toFixed(2)}</span></div>` : ""}
-            ${finalExtraCharges > 0 ? `<div style="display: flex; justify-content: space-between; font-size: 14px; color: #111827; margin-bottom: 8px;"><span>Extra Charges:</span><span style="font-weight: 700;">+ ${currency}${finalExtraCharges.toFixed(2)}</span></div>` : ""}
-            <div style="display: flex; justify-content: space-between; font-size: 18px; font-weight: 900; color: #111827; margin-top: 16px; padding-top: 12px; border-top: 1px dashed #d1d5db;"><span>GRAND TOTAL</span><span>${currency}${calculatedGrandTotal.toFixed(2)}</span></div>
-            ${amountPaid > 0 ? `<div style="display: flex; justify-content: space-between; font-size: 14px; font-weight: 700; color: #059669; margin-top: 8px;"><span>Already Paid</span><span>- ${currency}${amountPaid.toFixed(2)}</span></div><div style="display: flex; justify-content: space-between; font-size: 18px; font-weight: 900; color: #dc2626; margin-top: 8px;"><span>AMOUNT DUE</span><span>${currency}${amountDue.toFixed(2)}</span></div>` : ""}
+          <div style="margin-bottom:24px;">${itemsHtml}</div>
+          <div style="border-top:2px solid #111827;padding-top:16px;margin-top:24px;">
+            <div style="display:flex;justify-content:space-between;font-size:14px;color:#4b5563;margin-bottom:8px;"><span>Total Orders Delivered:</span><span>${totalItemsCount}</span></div>
+            <div style="display:flex;justify-content:space-between;font-size:14px;color:#111827;font-weight:700;margin-bottom:8px;margin-top:12px;"><span>Subtotal:</span><span>${currency}${finalSubtotal.toFixed(2)}</span></div>
+            ${finalDiscount > 0 ? `<div style="display:flex;justify-content:space-between;font-size:14px;color:#059669;margin-bottom:8px;"><span>Discount:</span><span style="font-weight:700;">- ${currency}${finalDiscount.toFixed(2)}</span></div>` : ""}
+            ${finalTax > 0 ? `<div style="display:flex;justify-content:space-between;font-size:14px;color:#dc2626;margin-bottom:8px;"><span>Tax:</span><span style="font-weight:700;">+ ${currency}${finalTax.toFixed(2)}</span></div>` : ""}
+            ${finalExtraCharges > 0 ? `<div style="display:flex;justify-content:space-between;font-size:14px;color:#111827;margin-bottom:8px;"><span>Extra Charges:</span><span style="font-weight:700;">+ ${currency}${finalExtraCharges.toFixed(2)}</span></div>` : ""}
+            <div style="display:flex;justify-content:space-between;font-size:18px;font-weight:900;color:#111827;margin-top:16px;padding-top:12px;border-top:1px dashed #d1d5db;"><span>GRAND TOTAL</span><span>${currency}${calculatedGrandTotal.toFixed(2)}</span></div>
+            ${amountPaid > 0 ? `<div style="display:flex;justify-content:space-between;font-size:14px;font-weight:700;color:#059669;margin-top:8px;"><span>Already Paid</span><span>- ${currency}${amountPaid.toFixed(2)}</span></div><div style="display:flex;justify-content:space-between;font-size:18px;font-weight:900;color:#dc2626;margin-top:8px;"><span>AMOUNT DUE</span><span>${currency}${amountDue.toFixed(2)}</span></div>` : ""}
           </div>
         </div>
-        <div style="text-align: center; margin-top: 40px; font-size: 12px; font-weight: 600; color: #6b7280;">Thank You for Visiting!</div>
+        <div style="text-align:center;margin-top:40px;font-size:12px;font-weight:600;color:#6b7280;">Thank You for Visiting!</div>
       </div>
     `;
 
@@ -449,7 +478,6 @@ export default function BillsTab() {
             html2canvas: { scale: 2 },
             jsPDF: { unit: "in", format: "letter", orientation: "portrait" },
           };
-
           (window as any)
             .html2pdf()
             .set(opt)
@@ -468,6 +496,9 @@ export default function BillsTab() {
           generateWebPDF();
         }
       } else {
+        // FIX 2: Lazy import so these native-only modules are never loaded on web
+        const Print = await import("expo-print");
+        const Sharing = await import("expo-sharing");
         const { uri } = await Print.printToFileAsync({ html: receiptHTML });
         await Sharing.shareAsync(uri, {
           UTI: ".pdf",
@@ -477,15 +508,22 @@ export default function BillsTab() {
       }
     } catch (err) {
       setIsDownloading(false);
-      Alert.alert("Error", "Could not generate PDF bill.");
+      if (Platform.OS === "web") {
+        window.alert("Could not generate PDF bill.");
+      } else {
+        Alert.alert("Error", "Could not generate PDF bill.");
+      }
     }
   };
+  // ─────────────────────────────────────────────────────────────────────────
 
-  // Convert old "upi" to "online" for seamless Razorpay connection
-  const activeMethod =
-    paymentData?.payment_method === "upi"
-      ? "upi"
-      : paymentData?.payment_method || "upi";
+  // ─── FIX 3: activeMethod ─────────────────────────────────────────────────
+  // Before: payment_method values of "online" or "pending" fell through to
+  // the raw value, which matched neither "upi" nor "cash", so the Razorpay
+  // button section was never rendered.
+  // After:  anything other than "cash" is treated as the UPI / Razorpay tab.
+  const activeMethod = paymentData?.payment_method === "cash" ? "cash" : "upi";
+  // ─────────────────────────────────────────────────────────────────────────
 
   return (
     <View style={styles.mainWrapper}>
@@ -569,6 +607,7 @@ export default function BillsTab() {
                 </Text>
               </View>
 
+              {/* Order Items Card */}
               <View style={styles.card}>
                 <View style={styles.cardHeader}>
                   <Text style={styles.cardTitle}>Order Items</Text>
@@ -634,7 +673,7 @@ export default function BillsTab() {
                 </View>
               </View>
 
-              {/* 👇 UPDATED PAYMENT SECTION 👇 */}
+              {/* Payment Method Card */}
               {!isBillPaid && amountDue > 0 && paymentData && (
                 <View style={styles.card}>
                   <Text style={styles.cardTitle}>Payment Method</Text>
@@ -763,6 +802,7 @@ export default function BillsTab() {
                 </View>
               )}
 
+              {/* Bill Breakdown Card */}
               <View style={styles.card}>
                 <Text style={styles.cardTitle}>Bill Breakdown</Text>
 
@@ -839,16 +879,14 @@ export default function BillsTab() {
 
                 {amountDue > 0 && (
                   <View style={styles.grandTotalRow}>
-                    <View>
-                      <Text
-                        style={[
-                          styles.grandTotalLabel,
-                          { color: THEME.danger, fontSize: 18 },
-                        ]}
-                      >
-                        Amount Due
-                      </Text>
-                    </View>
+                    <Text
+                      style={[
+                        styles.grandTotalLabel,
+                        { color: THEME.danger, fontSize: 18 },
+                      ]}
+                    >
+                      Amount Due
+                    </Text>
                     <Text
                       style={[
                         styles.grandTotalValue,
@@ -1057,8 +1095,6 @@ const styles = StyleSheet.create({
     color: THEME.textSecondary,
   },
   methodTextActive: { color: ANN.darkBlue, fontWeight: "800" },
-
-  // 👇 ADDED RAZORPAY STYLES 👇
   upiDisplayBox: {
     backgroundColor: ANN.darkBlueLight,
     borderRadius: 12,
@@ -1099,11 +1135,7 @@ const styles = StyleSheet.create({
     width: "100%",
     marginVertical: 20,
   },
-  dividerLine: {
-    flex: 1,
-    height: 1,
-    backgroundColor: "rgba(42, 71, 149, 0.2)",
-  },
+  dividerLine: { flex: 1, height: 1, backgroundColor: "rgba(42,71,149,0.2)" },
   dividerText: {
     marginHorizontal: 12,
     fontSize: 12,
@@ -1116,12 +1148,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     fontWeight: "500",
   },
-  qrInnerSmall: {
-    backgroundColor: "#ffffff",
-    padding: 10,
-    borderRadius: 8,
-  },
-
+  qrInnerSmall: { backgroundColor: "#ffffff", padding: 10, borderRadius: 8 },
   cashDisplayBox: {
     backgroundColor: ANN.orangeLight,
     borderRadius: 12,
@@ -1211,24 +1238,6 @@ const styles = StyleSheet.create({
     color: THEME.textSecondary,
     letterSpacing: 0.5,
   },
-  infoBanner: {
-    flexDirection: "row",
-    backgroundColor: "rgba(69, 106, 186, 0.1)",
-    padding: 16,
-    borderRadius: 12,
-    alignItems: "flex-start",
-    gap: 12,
-    marginBottom: 20,
-    borderWidth: 1,
-    borderColor: "rgba(42, 71, 149, 0.15)",
-  },
-  infoBannerText: {
-    flex: 1,
-    fontSize: 13,
-    color: ANN.darkBlue,
-    lineHeight: 18,
-    fontWeight: "500",
-  },
   emptyState: {
     flex: 1,
     justifyContent: "center",
@@ -1257,4 +1266,22 @@ const styles = StyleSheet.create({
     borderRadius: 12,
   },
   askBillBtnText: { color: "#fff", fontWeight: "bold", fontSize: 15 },
+  infoBanner: {
+    flexDirection: "row",
+    backgroundColor: "rgba(69,106,186,0.1)",
+    padding: 16,
+    borderRadius: 12,
+    alignItems: "flex-start",
+    gap: 12,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: "rgba(42,71,149,0.15)",
+  },
+  infoBannerText: {
+    flex: 1,
+    fontSize: 13,
+    color: ANN.darkBlue,
+    lineHeight: 18,
+    fontWeight: "500",
+  },
 });

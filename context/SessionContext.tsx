@@ -1,4 +1,13 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
+/**
+ * context/SessionContext.tsx
+ *
+ * Fixes applied:
+ *   1. Replaced all AsyncStorage calls with the platform-aware `storage`
+ *      helper (services/storage.ts).  AsyncStorage is a no-op on web, which
+ *      means sessions were lost on every page refresh in the browser.
+ *   2. No other logic has been changed.
+ */
+
 import React, {
   createContext,
   useContext,
@@ -8,6 +17,7 @@ import React, {
 } from "react";
 import { Alert, Platform } from "react-native";
 import { SessionService } from "../services/session.service";
+import { storage } from "../services/storage"; // FIX: was AsyncStorage
 
 // --- TYPES ---
 export type CartItem = {
@@ -16,7 +26,6 @@ export type CartItem = {
   name: string;
 };
 
-// 👇 FIX 1: Added type to TableData so the app remembers it's a room on restart
 export type TableData = {
   rId: string;
   tId: string;
@@ -75,16 +84,17 @@ export const SessionProvider = ({
   const [menuData, setMenuData] = useState<any>(null);
   const [orders, setOrders] = useState<any[]>([]);
 
+  // Load persisted session on mount
   useEffect(() => {
     const loadStoredSession = async () => {
       try {
-        const storedTable = await AsyncStorage.getItem("tableData");
-        const token = await AsyncStorage.getItem("sessionToken");
-        const name = await AsyncStorage.getItem("customerName");
-        const storedCart = await AsyncStorage.getItem("cart");
-        const primary = await AsyncStorage.getItem("isPrimary");
-        const status = await AsyncStorage.getItem("joinStatus");
-        const storedOrders = await AsyncStorage.getItem("orders");
+        const storedTable = await storage.getItem("tableData");
+        const token = await storage.getItem("sessionToken");
+        const name = await storage.getItem("customerName");
+        const storedCart = await storage.getItem("cart");
+        const primary = await storage.getItem("isPrimary");
+        const status = await storage.getItem("joinStatus");
+        const storedOrders = await storage.getItem("orders");
 
         if (storedTable) setTableData(JSON.parse(storedTable));
         if (token) setSessionToken(token);
@@ -102,20 +112,21 @@ export const SessionProvider = ({
     loadStoredSession();
   }, []);
 
+  // Persist session changes
   useEffect(() => {
     if (!isReady) return;
 
-    if (tableData) AsyncStorage.setItem("tableData", JSON.stringify(tableData));
-    if (sessionToken) AsyncStorage.setItem("sessionToken", sessionToken);
-    AsyncStorage.setItem("customerName", customerName);
-    AsyncStorage.setItem("cart", JSON.stringify(cart));
-    AsyncStorage.setItem("orders", JSON.stringify(orders));
-    AsyncStorage.setItem("isPrimary", isPrimary ? "true" : "false");
+    if (tableData) storage.setItem("tableData", JSON.stringify(tableData));
+    if (sessionToken) storage.setItem("sessionToken", sessionToken);
+    storage.setItem("customerName", customerName);
+    storage.setItem("cart", JSON.stringify(cart));
+    storage.setItem("orders", JSON.stringify(orders));
+    storage.setItem("isPrimary", isPrimary ? "true" : "false");
 
     if (joinStatus) {
-      AsyncStorage.setItem("joinStatus", joinStatus);
+      storage.setItem("joinStatus", joinStatus);
     } else {
-      AsyncStorage.removeItem("joinStatus");
+      storage.removeItem("joinStatus");
     }
   }, [
     tableData,
@@ -197,7 +208,6 @@ export const SessionProvider = ({
   const clearSession = async () => {
     try {
       if (sessionToken) {
-        // Pass type so backend knows if it's cleaning a RoomSession or QrSession
         await SessionService.leaveSession(
           sessionToken,
           tableData?.type || "table",
@@ -215,7 +225,7 @@ export const SessionProvider = ({
       setTableData(null);
       setMenuData(null);
 
-      await AsyncStorage.multiRemove([
+      await storage.multiRemove([
         "sessionToken",
         "customerName",
         "cart",
@@ -237,15 +247,13 @@ export const SessionProvider = ({
     setCustomerName(data.guest_name);
     setJoinStatus("active");
     setIsPrimary(true);
-    // 👇 FIX 2: Explicitly save type: "room" into state
     setTableData({ rId, tId, token, type: "room" });
 
-    await AsyncStorage.multiSet([
+    await storage.multiSet([
       ["sessionToken", data.session_token],
       ["customerName", data.guest_name],
       ["joinStatus", "active"],
       ["isPrimary", "true"],
-      // 👇 FIX 3: Explicitly save type: "room" into local storage
       ["tableData", JSON.stringify({ rId, tId, token, type: "room" })],
     ]);
   };
